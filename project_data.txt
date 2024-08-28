@@ -1,0 +1,1059 @@
+File: requirements.txt
+
+tensorflow==2.17.0
+numpy==2.0.2
+pandas==2.2.2
+scikit-learn==1.5.1
+matplotlib==3.9.2
+seaborn==0.13.2
+tweepy==4.14.0
+praw==7.7.1
+ccxt==4.3.89
+pyyaml==6.0.2
+transformers==4.44.2
+torch==2.4.0
+tqdm==4.66.5
+
+
+================================================================================
+
+File: train_model.py
+
+import logging
+import numpy as np
+from models.multi_input_nn import MultiInputNN
+from data_processing.market_data import MarketDataLoader
+from utils.helpers import setup_logging, load_config, create_tensorboard_callback, evaluate_model, plot_training_history
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+
+def main():
+    setup_logging()
+    logger = logging.getLogger(__name__)
+    config = load_config()
+
+    logger.info("Starting model training process")
+
+    # Initialize data loader and load data
+    market_data_loader = MarketDataLoader(config['market_data'])
+    X_market, X_sentiment, y = market_data_loader.load_training_data()
+
+    # Split data into training and testing sets
+    X_market_train, X_market_test, X_sentiment_train, X_sentiment_test, y_train, y_test = train_test_split(
+        X_market, X_sentiment, y, test_size=0.2, random_state=42
+    )
+
+    # Initialize and compile the model
+    model = MultiInputNN(config['model_params'])
+    model.compile_model()
+
+    # Create callbacks
+    tensorboard_callback = create_tensorboard_callback(config['tensorboard']['log_dir'])
+    early_stopping = EarlyStopping(patience=10, restore_best_weights=True)
+    reduce_lr = ReduceLROnPlateau(factor=0.2, patience=5, min_lr=1e-6)
+
+    # Train the model
+    history = model.fit(
+        [X_market_train, X_sentiment_train], y_train,
+        validation_data=([X_market_test, X_sentiment_test], y_test),
+        epochs=config['training']['epochs'],
+        batch_size=config['training']['batch_size'],
+        callbacks=[tensorboard_callback, early_stopping, reduce_lr]
+    )
+
+    # Evaluate the model
+    evaluate_model(model, [X_market_test, X_sentiment_test], y_test)
+
+    # Plot training history
+    plot_training_history(history)
+
+    # Save the model
+    model.save('models/trained_multi_input_model.h5')
+    logger.info("Model training completed and saved.")
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+
+File: collect_sentiment.py
+
+import logging
+import pandas as pd
+from data_processing.twitter_data import TwitterCollector
+from data_processing.reddit_data import RedditCollector
+from sentiment_analysis.model import SentimentAnalyzer
+from utils.helpers import setup_logging, load_config, aggregate_sentiment
+from tqdm import tqdm
+
+def main():
+    setup_logging()
+    logger = logging.getLogger(__name__)
+    config = load_config()
+
+    logger.info("Starting sentiment collection process")
+
+    # Initialize data collectors and sentiment analyzer
+    twitter_collector = TwitterCollector(config['twitter'])
+    reddit_collector = RedditCollector(config['reddit'])
+    sentiment_analyzer = SentimentAnalyzer(model_path='models/fine_tuned_sentiment_model')
+
+    all_sentiments = []
+
+    for symbol in tqdm(config['symbols'], desc="Processing symbols"):
+        logger.info(f"Collecting and analyzing sentiment for {symbol}")
+
+        # Collect data
+        tweets = twitter_collector.collect_tweets(symbol, config['sentiment']['window'])
+        reddit_posts = reddit_collector.collect_posts(symbol, config['sentiment']['window'])
+
+        # Analyze sentiment
+        tweet_sentiments = sentiment_analyzer.analyze_batch(tweets)
+        reddit_sentiments = sentiment_analyzer.analyze_batch(reddit_posts)
+
+        # Aggregate results
+        aggregated_sentiment = aggregate_sentiment(tweet_sentiments, reddit_sentiments)
+
+        all_sentiments.append({
+            'symbol': symbol,
+            'sentiment': aggregated_sentiment,
+            'tweet_count': len(tweets),
+            'reddit_post_count': len(reddit_posts)
+        })
+
+        logger.info(f"Sentiment analysis complete for {symbol}: {aggregated_sentiment:.4f}")
+
+    # Save results to CSV
+    df = pd.DataFrame(all_sentiments)
+    df.to_csv('data/sentiment_results.csv', index=False)
+    logger.info("Sentiment results saved to data/sentiment_results.csv")
+
+    # Visualize results
+    plot_sentiment_results(df)
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+
+File: fine_tune_sentiment.py
+
+import logging
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from transformers import TrainingArguments, Trainer, AutoModelForSequenceClassification, AutoTokenizer
+from datasets import Dataset
+from utils.helpers import setup_logging, load_config
+import torch
+
+def load_crypto_sentiment_data(file_path):
+    df = pd.read_csv(file_path)
+    return Dataset.from_pandas(df)
+
+def tokenize_function(examples):
+    return tokenizer(examples["text"], padding="max_length", truncation=True)
+
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    predictions = torch.argmax(torch.Tensor(logits), dim=-1)
+    return {"accuracy": (predictions == torch.Tensor(labels)).float().mean().item()}
+
+def main():
+    setup_logging()
+    logger = logging.getLogger(__name__)
+    config = load_config()
+
+    logger.info("Starting sentiment model fine-tuning process")
+
+    # Load crypto-specific sentiment data
+    dataset = load_crypto_sentiment_data('data/crypto_sentiment.csv')
+    train_dataset, eval_dataset = train_dataset.train_test_split(test_size=0.2, seed=42).values()
+
+    # Load pre-trained model and tokenizer
+    model_name = "finiteautomata/bertweet-base-sentiment-analysis"
+    global tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name)
+
+    # Tokenize datasets
+    tokenized_train = train_dataset.map(tokenize_function, batched=True)
+    tokenized_eval = eval_dataset.map(tokenize_function, batched=True)
+
+    # Set up training arguments
+    training_args = TrainingArguments(
+        output_dir="./results",
+        num_train_epochs=3,
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=64,
+        warmup_steps=500,
+        weight_decay=0.01,
+        logging_dir='./logs',
+        logging_steps=10,
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+    )
+
+    # Initialize Trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_train,
+        eval_dataset=tokenized_eval,
+        compute_metrics=compute_metrics,
+    )
+
+    # Fine-tune the model
+    logger.info("Fine-tuning sentiment model...")
+    trainer.train()
+
+    # Save the fine-tuned model
+    model.save_pretrained('models/fine_tuned_sentiment_model')
+    tokenizer.save_pretrained('models/fine_tuned_sentiment_tokenizer')
+
+    logger.info("Fine-tuning complete. Model saved.")
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+
+File: predict.py
+
+import logging
+import pandas as pd
+from models.multi_input_nn import MultiInputNN
+from data_processing.market_data import MarketDataLoader
+from sentiment_analysis.model import SentimentAnalyzer
+from utils.helpers import setup_logging, load_config, prepare_prediction_input, wait_for_next_cycle, save_predictions, plot_predictions
+from datetime import datetime
+import time
+
+def main():
+    setup_logging()
+    logger = logging.getLogger(__name__)
+    config = load_config()
+
+    logger.info("Starting prediction process")
+
+    # Load the trained model
+    model = MultiInputNN.load('models/trained_multi_input_model.h5', config['model_params'])
+
+    # Initialize data collectors and sentiment analyzer
+    market_data_loader = MarketDataLoader(config['market_data'])
+    sentiment_analyzer = SentimentAnalyzer(model_path='models/fine_tuned_sentiment_model')
+
+    all_predictions = []
+
+    while True:
+        predictions = []
+        timestamp = datetime.utcnow()
+
+        for symbol in config['symbols']:
+            # Fetch latest market data and sentiment
+            latest_market_data = market_data_loader.get_latest_data(symbol)
+            latest_sentiment = sentiment_analyzer.get_latest_sentiment(symbol, market_data_loader)
+
+            if latest_market_data is None:
+                logger.warning(f"Skipping prediction for {symbol} due to missing market data")
+                continue
+
+            # Prepare input for prediction
+            X_market, X_sentiment = prepare_prediction_input(latest_market_data, latest_sentiment)
+
+            # Make prediction
+            prediction = model.predict([X_market, X_sentiment])
+            predictions.append((symbol, prediction[0][0]))
+
+            logger.info(f"Prediction for {symbol}: {prediction[0][0]:.4f}")
+
+        # Save predictions
+        save_predictions(predictions, config['symbols'], timestamp)
+        all_predictions.extend([(symbol, pred, timestamp) for symbol, pred in predictions])
+
+        # Plot predictions
+        if len(all_predictions) > 0:
+            plot_predictions(all_predictions)
+
+        # Wait for the next prediction cycle
+        wait_for_next_cycle(config['prediction']['interval'])
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+
+File: collect_project_data.py
+
+import os
+
+def read_file(file_path):
+    with open(file_path, 'r', encoding='utf-8') as file:
+        return file.read()
+
+def collect_project_data(root_dir, output_file):
+    relevant_extensions = ['.py', '.yml', '.yaml', '.txt', '.md', '.sh']
+    project_data = []
+
+    for root, dirs, files in os.walk(root_dir):
+        for file in files:
+            if any(file.endswith(ext) for ext in relevant_extensions):
+                file_path = os.path.join(root, file)
+                relative_path = os.path.relpath(file_path, root_dir)
+                try:
+                    content = read_file(file_path)
+                    project_data.append(f"File: {relative_path}\n\n{content}\n\n{'='*80}\n")
+                except Exception as e:
+                    print(f"Error reading {file_path}: {e}")
+
+    with open(output_file, 'w', encoding='utf-8') as out_file:
+        out_file.write("\n".join(project_data))
+
+def main():
+    root_dir = '.'  # Assumes the script is run from the project root directory
+    output_file = 'project_data.txt'
+    collect_project_data(root_dir, output_file)
+    print(f"Project data collected and saved to {output_file}")
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+
+File: run.sh
+
+#!/bin/bash
+
+set -e
+
+# Function to check if a command was successful
+check_status() {
+    if [ $? -eq 0 ]; then
+        echo "✅ $1 completed successfully"
+    else
+        echo "❌ $1 failed"
+        exit 1
+    fi
+}
+
+# Create and activate virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install requirements
+pip install -r requirements.txt
+check_status "Installing requirements"
+
+# Run fine-tuning of sentiment model
+python fine_tune_sentiment.py
+check_status "Fine-tuning sentiment model"
+
+# Collect sentiment data
+python collect_sentiment.py
+check_status "Collecting sentiment data"
+
+# Train the main model
+python train_model.py
+check_status "Training main model"
+
+# Start the prediction process
+python predict.py
+check_status "Starting prediction process"
+
+echo "🎉 All processes completed successfully!"
+
+================================================================================
+
+File: README.md
+
+# Multi-Modal Sentiment Analysis for Crypto Market Prediction
+
+## Overview
+
+This project implements a sophisticated sentiment analysis system that combines market data with social media sentiment to predict cryptocurrency price movements. It's designed to give our exchange a competitive edge by incorporating real-time public sentiment into our trading strategies.
+
+## Features
+
+- Integration with Twitter and Reddit APIs for sentiment data collection
+- Advanced NLP model for crypto-specific sentiment analysis
+- Multi-input neural network combining market data and sentiment scores
+- Real-time prediction system for multiple cryptocurrencies
+
+## Prerequisites
+
+- Python 3.8+
+- TensorFlow 2.4+
+- transformers
+- tweepy
+- praw
+- pandas
+- numpy
+- ccxt
+
+## Installation
+
+1. Clone the repository:
+   ```
+   git clone https://github.com/selimozten/mmsag.git
+   ```
+
+2. Navigate to the project directory:
+   ```
+   cd mmsag
+   ```
+
+3. Create and activate a virtual environment:
+   ```
+   python -m venv venv
+   source venv/bin/activate  # On Windows, use `venv\Scripts\activate`
+   ```
+
+4. Install the required packages:
+   ```
+   pip install -r requirements.txt
+   ```
+
+5. Set up your API credentials:
+   - Copy `credentials.example.yml` to `credentials.yml`
+   - Fill in your Twitter, Reddit, and exchange API credentials
+
+## Configuration
+
+Edit `config.yml` to customize the project settings:
+- `symbols`: List of cryptocurrency pairs to analyze
+- `timeframe`: Data timeframe for market analysis
+- `sentiment_window`: Time window for sentiment analysis
+- `model_params`: Neural network architecture parameters
+
+## Usage
+
+1. To run the sentiment collection and analysis:
+   ```
+   python collect_sentiment.py
+   ```
+
+2. To train the prediction model:
+   ```
+   python train_model.py
+   ```
+
+3. To make real-time predictions:
+   ```
+   python predict.py
+   ```
+
+## Project Structure
+
+- `collect_sentiment.py`: Script for collecting and analyzing sentiment data
+- `train_model.py`: Script for training the multi-input neural network
+- `predict.py`: Script for making real-time predictions
+- `models/`: Directory containing model definitions
+- `data_processing/`: Modules for data fetching and preprocessing
+- `sentiment_analysis/`: Modules for sentiment analysis
+- `utils/`: Utility functions and helpers
+- `config.yml`: Project configuration file
+- `credentials.yml`: API credentials (do not commit this file)
+- `tests/`: Directory containing unit and integration tests
+
+## Extending the Project
+
+### Adding New Data Sources
+
+1. Create a new module in `data_processing/` for the new source
+2. Implement the required API calls and data parsing
+3. Update `collect_sentiment.py` to incorporate the new source
+4. Modify the model in `models/multi_input_nn.py` if necessary
+
+### Improving the Sentiment Analysis
+
+1. Fine-tune the sentiment model on crypto-specific data:
+   ```
+   python fine_tune_sentiment.py
+   ```
+2. Experiment with different NLP models in `sentiment_analysis/model.py`
+
+## Testing
+
+Run the test suite with:
+```
+python -m pytest tests/
+```
+
+Ensure all tests pass before deploying any changes to production.
+
+## Monitoring and Logging
+
+- Logs are stored in the `logs/` directory
+- Use the `logging` module for consistent log formatting
+- Monitor model performance using TensorBoard:
+  ```
+  tensorboard --logdir=./logs/tensorboard
+  ```
+
+## Security Notes
+
+- Never commit `credentials.yml` or any file containing API keys
+- Rotate API keys regularly and update them in our secure key management system
+- Ensure all data processing follows our data protection guidelines
+
+## Internal Resources
+
+- For a detailed explanation of the sentiment analysis algorithm, see `docs/sentiment_algorithm.md`
+- For guidelines on model deployment, refer to our MLOps playbook in the company wiki
+
+## Support
+
+For issues or feature requests, please create an issue in this repository or contact the Data Science team directly.
+
+
+================================================================================
+
+File: credentials.yml
+
+
+
+================================================================================
+
+File: config.yml
+
+# Multi-Modal Sentiment Analysis for Crypto Market Prediction Configuration
+
+# Cryptocurrency symbols to analyze
+symbols:
+  - BTC/USD
+  - ETH/USD
+  - XRP/USD
+
+# Market data settings
+market_data:
+  timeframe: 1h  # 1 hour candles
+  lookback_period: 168  # 7 days of hourly data
+
+# Sentiment analysis settings
+sentiment:
+  window: 24h  # Time window for sentiment analysis
+  update_interval: 15m  # How often to update sentiment scores
+
+# Twitter API settings
+twitter:
+  max_tweets: 1000  # Maximum number of tweets to collect per symbol
+  languages: 
+    - en
+    - es
+
+# Reddit API settings
+reddit:
+  subreddits:
+    - CryptoCurrency
+    - Bitcoin
+    - ethereum
+  post_limit: 500  # Number of posts to analyze per subreddit
+
+# Model parameters
+model_params:
+  market_input_dim: 168  # Should match lookback_period
+  sentiment_input_dim: 24  # Should match sentiment window in hours
+  lstm_units: 64
+  dense_units: [128, 64]
+  dropout_rate: 0.2
+
+# Training settings
+training:
+  batch_size: 32
+  epochs: 100
+  validation_split: 0.2
+  early_stopping_patience: 10
+
+# Prediction settings
+prediction:
+  interval: 1h  # How often to make new predictions
+
+# Logging settings
+logging:
+  level: INFO
+  file: logs/mmsag.log
+
+# TensorBoard settings
+tensorboard:
+  log_dir: logs/tensorboard
+
+================================================================================
+
+File: tests/test_data_processing.py
+
+
+
+================================================================================
+
+File: tests/test_sentiment_analysis.py
+
+
+
+================================================================================
+
+File: tests/__init__.py
+
+
+
+================================================================================
+
+File: data_processing/__init__.py
+
+
+
+================================================================================
+
+File: data_processing/twitter_data.py
+
+import tweepy
+import yaml
+import logging
+from datetime import datetime, timedelta
+
+class TwitterCollector:
+    def __init__(self, config):
+        self.config = config
+        self.api = self._authenticate()
+        self.logger = logging.getLogger(__name__)
+
+    def _authenticate(self):
+        try:
+            with open('credentials.yml', 'r') as file:
+                creds = yaml.safe_load(file)['twitter']
+            auth = tweepy.OAuthHandler(creds['consumer_key'], creds['consumer_secret'])
+            auth.set_access_token(creds['access_token'], creds['access_token_secret'])
+            return tweepy.API(auth, wait_on_rate_limit=True)
+        except Exception as e:
+            self.logger.error(f"Failed to authenticate with Twitter API: {e}")
+            raise
+
+    def collect_tweets(self, symbol, time_window):
+        query = f"${symbol} OR #{symbol.lower()}"
+        tweets = []
+        end_time = datetime.utcnow()
+        start_time = end_time - timedelta(hours=time_window)
+
+        try:
+            for tweet in tweepy.Cursor(self.api.search_tweets, q=query, lang=self.config['languages'], 
+                                       tweet_mode="extended").items(self.config['max_tweets']):
+                if start_time <= tweet.created_at <= end_time:
+                    tweets.append(tweet.full_text)
+                elif tweet.created_at < start_time:
+                    break
+            self.logger.info(f"Collected {len(tweets)} tweets for {symbol}")
+            return tweets
+        except tweepy.TweepError as e:
+            self.logger.error(f"Error collecting tweets for {symbol}: {e}")
+            return []
+
+    def get_recent_data(self, symbol):
+        return self.collect_tweets(symbol, self.config['sentiment']['window'])
+
+================================================================================
+
+File: data_processing/market_data.py
+
+import ccxt
+import pandas as pd
+import numpy as np
+import logging
+from datetime import datetime, timedelta
+
+class MarketDataLoader:
+    def __init__(self, config):
+        self.config = config
+        self.exchange = ccxt.binance()
+        self.logger = logging.getLogger(__name__)
+
+    def fetch_ohlcv(self, symbol, timeframe, since, limit):
+        try:
+            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, since, limit)
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+            return df
+        except Exception as e:
+            self.logger.error(f"Error fetching OHLCV data for {symbol}: {e}")
+            return pd.DataFrame()
+
+    def preprocess_data(self, df):
+        # Calculate additional features (e.g., moving averages, RSI)
+        df['MA7'] = df['close'].rolling(window=7).mean()
+        df['MA30'] = df['close'].rolling(window=30).mean()
+        df['RSI'] = self.calculate_rsi(df['close'])
+        
+        # Normalize the data
+        for column in df.columns:
+            if column != 'timestamp':
+                df[column] = (df[column] - df[column].mean()) / df[column].std()
+        
+        return df.dropna()
+
+    def calculate_rsi(self, prices, period=14):
+        deltas = np.diff(prices)
+        seed = deltas[:period+1]
+        up = seed[seed >= 0].sum()/period
+        down = -seed[seed < 0].sum()/period
+        rs = up/down
+        rsi = np.zeros_like(prices)
+        rsi[:period] = 100. - 100./(1. + rs)
+
+        for i in range(period, len(prices)):
+            delta = deltas[i-1]
+            if delta > 0:
+                upval = delta
+                downval = 0.
+            else:
+                upval = 0.
+                downval = -delta
+
+            up = (up*(period-1) + upval)/period
+            down = (down*(period-1) + downval)/period
+            rs = up/down
+            rsi[i] = 100. - 100./(1. + rs)
+
+        return rsi
+
+    def load_training_data(self):
+        X_market = []
+        X_sentiment = []  # Placeholder for sentiment data
+        y = []
+
+        for symbol in self.config['symbols']:
+            df = self.fetch_ohlcv(symbol, self.config['timeframe'], 
+                                  limit=self.config['lookback_period'] * 2)
+            df = self.preprocess_data(df)
+
+            for i in range(len(df) - self.config['lookback_period']):
+                X_market.append(df.iloc[i:i+self.config['lookback_period']].values)
+                y.append(df.iloc[i+self.config['lookback_period']]['close'])
+
+        return np.array(X_market), np.array(X_sentiment), np.array(y)
+
+    def get_latest_data(self, symbol):
+        end_time = datetime.utcnow()
+        start_time = end_time - timedelta(hours=self.config['lookback_period'])
+        df = self.fetch_ohlcv(symbol, self.config['timeframe'], int(start_time.timestamp() * 1000), self.config['lookback_period'])
+        
+        if df.empty:
+            self.logger.warning(f"No data retrieved for {symbol}. Returning None.")
+            return None
+        
+        df = self.preprocess_data(df)
+        
+        if len(df) < self.config['lookback_period']:
+            self.logger.warning(f"Insufficient data for {symbol}. Expected {self.config['lookback_period']} rows, got {len(df)}.")
+            return None
+        
+        return df.iloc[-self.config['lookback_period']:].values.reshape(1, self.config['lookback_period'], -1)
+
+================================================================================
+
+File: data_processing/reddit_data.py
+
+import praw
+import yaml
+import logging
+from datetime import datetime, timedelta
+
+class RedditCollector:
+    def __init__(self, config):
+        self.config = config
+        self.reddit = self._authenticate()
+        self.logger = logging.getLogger(__name__)
+
+    def _authenticate(self):
+        try:
+            with open('credentials.yml', 'r') as file:
+                creds = yaml.safe_load(file)['reddit']
+            return praw.Reddit(client_id=creds['client_id'],
+                               client_secret=creds['client_secret'],
+                               user_agent=creds['user_agent'])
+        except Exception as e:
+            self.logger.error(f"Failed to authenticate with Reddit API: {e}")
+            raise
+
+    def collect_posts(self, symbol, time_window):
+        posts = []
+        end_time = datetime.utcnow()
+        start_time = end_time - timedelta(hours=time_window)
+
+        try:
+            for subreddit_name in self.config['subreddits']:
+                subreddit = self.reddit.subreddit(subreddit_name)
+                for post in subreddit.search(symbol, limit=self.config['post_limit'], sort='new'):
+                    if start_time <= datetime.fromtimestamp(post.created_utc) <= end_time:
+                        posts.append(post.title + " " + post.selftext)
+                    elif datetime.fromtimestamp(post.created_utc) < start_time:
+                        break
+            self.logger.info(f"Collected {len(posts)} Reddit posts for {symbol}")
+            return posts
+        except Exception as e:
+            self.logger.error(f"Error collecting Reddit posts for {symbol}: {e}")
+            return []
+
+    def get_recent_data(self, symbol):
+        return self.collect_posts(symbol, self.config['sentiment']['window'])
+
+================================================================================
+
+File: utils/__init__.py
+
+
+
+================================================================================
+
+File: utils/helpers.py
+
+import logging
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tensorflow.keras.callbacks import TensorBoard
+import yaml
+import pandas as pd
+
+def setup_logging():
+    with open('config.yml', 'r') as config_file:
+        config = yaml.safe_load(config_file)
+    
+    logging.basicConfig(level=config['logging']['level'],
+                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                        filename=config['logging']['file'])
+    
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(name)-12s: %(levelname)-8s %(message)s')
+    console.setFormatter(formatter)
+    logging.getLogger('').addHandler(console)
+
+def load_config():
+    with open('config.yml', 'r') as config_file:
+        return yaml.safe_load(config_file)
+
+def aggregate_sentiment(tweet_sentiments, reddit_sentiments):
+    combined = np.concatenate([tweet_sentiments, reddit_sentiments])
+    return np.mean(combined)
+
+def prepare_prediction_input(market_data, sentiment_data):
+    X_market = np.array(market_data).reshape(1, -1, market_data.shape[-1])
+    X_sentiment = np.array(sentiment_data).reshape(1, -1, 1)
+    return X_market, X_sentiment
+
+def wait_for_next_cycle(interval):
+    next_cycle = (int(time.time()) // interval + 1) * interval
+    time.sleep(next_cycle - time.time())
+
+def log_training_results(history):
+    logger = logging.getLogger(__name__)
+    logger.info("Training completed.")
+    logger.info(f"Final loss: {history.history['loss'][-1]:.4f}")
+    logger.info(f"Final validation loss: {history.history['val_loss'][-1]:.4f}")
+
+def create_tensorboard_callback(log_dir):
+    return TensorBoard(log_dir=log_dir, histogram_freq=1, write_graph=True, write_images=True)
+
+def evaluate_model(model, X_test, y_test):
+    loss, mae = model.evaluate(X_test, y_test, verbose=0)
+    logger = logging.getLogger(__name__)
+    logger.info(f"Test Loss: {loss:.4f}")
+    logger.info(f"Test MAE: {mae:.4f}")
+    return loss, mae
+
+def save_predictions(predictions, symbols, timestamp):
+    logger = logging.getLogger(__name__)
+    df = pd.DataFrame(predictions, columns=['symbol', 'prediction'])
+    df['timestamp'] = timestamp
+    df.to_csv(f'data/predictions_{timestamp.strftime("%Y%m%d_%H%M%S")}.csv', index=False)
+    logger.info(f"Predictions saved to data/predictions_{timestamp.strftime('%Y%m%d_%H%M%S')}.csv")
+
+def plot_sentiment_results(df):
+    plt.figure(figsize=(12, 6))
+    sns.barplot(x='symbol', y='sentiment', data=df)
+    plt.title('Aggregated Sentiment by Symbol')
+    plt.xlabel('Symbol')
+    plt.ylabel('Sentiment Score')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig('plots/sentiment_results.png')
+    plt.close()
+
+def plot_training_history(history):
+    plt.figure(figsize=(12, 6))
+    plt.plot(history.history['loss'], label='Training Loss')
+    plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.title('Model Training History')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('plots/training_history.png')
+    plt.close()
+
+def plot_predictions(predictions):
+    df = pd.DataFrame(predictions, columns=['symbol', 'prediction', 'timestamp'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    
+    plt.figure(figsize=(12, 6))
+    for symbol in df['symbol'].unique():
+        symbol_data = df[df['symbol'] == symbol]
+        plt.plot(symbol_data['timestamp'], symbol_data['prediction'], label=symbol)
+    
+    plt.title('Price Predictions Over Time')
+    plt.xlabel('Timestamp')
+    plt.ylabel('Predicted Price')
+    plt.legend()
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig('plots/predictions.png')
+    plt.close()
+
+def create_confusion_matrix(y_true, y_pred):
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+    plt.title('Confusion Matrix')
+    plt.xlabel('Predicted')
+    plt.ylabel('Actual')
+    plt.tight_layout()
+    plt.savefig('plots/confusion_matrix.png')
+    plt.close()
+
+def plot_feature_importance(model, feature_names):
+    importance = model.feature_importances_
+    indices = np.argsort(importance)[::-1]
+    
+    plt.figure(figsize=(12, 8))
+    plt.title("Feature Importances")
+    plt.bar(range(len(importance)), importance[indices])
+    plt.xticks(range(len(importance)), [feature_names[i] for i in indices], rotation=90)
+    plt.tight_layout()
+    plt.savefig('plots/feature_importance.png')
+    plt.close()
+
+def create_correlation_heatmap(df):
+    corr = df.corr()
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(corr, annot=True, cmap='coolwarm', vmin=-1, vmax=1, center=0)
+    plt.title('Correlation Heatmap')
+    plt.tight_layout()
+    plt.savefig('plots/correlation_heatmap.png')
+    plt.close()
+
+================================================================================
+
+File: models/multi_input_nn.py
+
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, LSTM, Dense, Concatenate, Dropout, BatchNormalization
+from tensorflow.keras.regularizers import l2
+
+class MultiInputNN:
+    def __init__(self, config):
+        self.config = config
+        self.model = self.build_model()
+
+    def build_model(self):
+        # Market data input
+        market_input = Input(shape=(self.config['market_input_dim'], self.config['market_features']), name='market_input')
+        market_lstm = LSTM(self.config['lstm_units'], return_sequences=False, kernel_regularizer=l2(0.01))(market_input)
+        market_lstm = BatchNormalization()(market_lstm)
+
+        # Sentiment input
+        sentiment_input = Input(shape=(self.config['sentiment_input_dim'], 1), name='sentiment_input')
+        sentiment_lstm = LSTM(self.config['lstm_units'], return_sequences=False, kernel_regularizer=l2(0.01))(sentiment_input)
+        sentiment_lstm = BatchNormalization()(sentiment_lstm)
+
+        # Concatenate market and sentiment features
+        combined = Concatenate()([market_lstm, sentiment_lstm])
+
+        # Dense layers
+        for i, units in enumerate(self.config['dense_units']):
+            combined = Dense(units, activation='relu', kernel_regularizer=l2(0.01), name=f'dense_{i}')(combined)
+            combined = BatchNormalization()(combined)
+            combined = Dropout(self.config['dropout_rate'])(combined)
+
+        # Output layer
+        output = Dense(1, activation='linear', name='price_prediction')(combined)
+
+        # Create model
+        model = Model(inputs=[market_input, sentiment_input], outputs=output)
+
+        return model
+
+    def compile_model(self, optimizer='adam', loss='mean_squared_error'):
+        self.model.compile(optimizer=optimizer, loss=loss, metrics=['mae'])
+
+    def summary(self):
+        return self.model.summary()
+
+    def fit(self, X_market, X_sentiment, y, **kwargs):
+        return self.model.fit([X_market, X_sentiment], y, **kwargs)
+
+    def predict(self, X_market, X_sentiment):
+        return self.model.predict([X_market, X_sentiment])
+
+    def save(self, filepath):
+        self.model.save(filepath)
+
+    @classmethod
+    def load(cls, filepath, config):
+        instance = cls(config)
+        instance.model = tf.keras.models.load_model(filepath)
+        return instance
+
+    def get_feature_importance(self):
+        # This is a simplified version of feature importance
+        # For more accurate results, consider using SHAP values or other model-specific techniques
+        input_layer = self.model.get_layer('market_input')
+        output_layer = self.model.get_layer('price_prediction')
+        
+        grads = tf.gradients(output_layer.output, input_layer.output)[0]
+        pooled_grads = tf.reduce_mean(grads, axis=(0, 1))
+        
+        return pooled_grads.numpy()
+
+================================================================================
+
+File: sentiment_analysis/__init__.py
+
+
+
+================================================================================
+
+File: sentiment_analysis/model.py
+
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
+import numpy as np
+
+class SentimentAnalyzer:
+    def __init__(self, model_path='models/fine_tuned_sentiment_model'):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_path)
+        self.model.eval()
+
+    def analyze_batch(self, texts, batch_size=32):
+        sentiments = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i+batch_size]
+            inputs = self.tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=128)
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+            scores = torch.nn.functional.softmax(outputs.logits, dim=-1)
+            sentiments.extend(scores[:, 2].tolist())  # Assuming index 2 corresponds to positive sentiment
+        return np.array(sentiments)
+
+    def get_latest_sentiment(self, symbol, data_collector):
+        recent_texts = data_collector.get_recent_data(symbol)
+        sentiments = self.analyze_batch(recent_texts)
+        return np.mean(sentiments)
+
+    @staticmethod
+    def preprocess_text(text):
+        # Add any text preprocessing steps here
+        return text.lower()
+
+================================================================================

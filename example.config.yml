@@ -1,0 +1,65 @@
+# Multi-Modal Sentiment Analysis for Crypto Market Prediction Configuration
+
+# Cryptocurrency symbols to analyze
+symbols:
+  - BTC/USD
+  - ETH/USD
+  - XRP/USD
+
+# Market data settings
+market_data:
+  timeframe: 1h  # 1 hour candles
+  lookback_period: 168  # 7 days of hourly data
+
+# Sentiment analysis settings
+sentiment:
+  window: 24h  # Time window for sentiment analysis
+  update_interval: 15m  # How often to update sentiment scores
+
+# Twitter API settings
+twitter:
+  max_tweets: 1000  # Maximum number of tweets to collect per symbol
+  languages: 
+    - en
+    - es
+
+# Reddit API settings
+reddit:
+  subreddits:
+    - CryptoCurrency
+    - Bitcoin
+    - ethereum
+  post_limit: 500  # Number of posts to analyze per subreddit
+
+# Model parameters
+model_params:
+  market_input_dim: 168  # Should match lookback_period
+  sentiment_input_dim: 24  # Should match sentiment window in hours
+  lstm_units: 64
+  dense_units: [128, 64]
+  dropout_rate: 0.2
+
+# Training settings
+training:
+  batch_size: 32
+  epochs: 100
+  validation_split: 0.2
+  early_stopping_patience: 10
+
+# Prediction settings
+prediction:
+  interval: 1h  # How often to make new predictions
+
+# Logging settings
+logging:
+  level: INFO
+  file: logs/mmsag.log
+
+# TensorBoard settings
+tensorboard:
+  log_dir: logs/tensorboard
+
+# Dashboard settings
+dashboard:
+  update_interval: 5m  # How often to update the dashboard
+  prediction_days: 7  # Number of days to predict in the future

@@ -1,0 +1,15 @@
+tensorflow==2.17.0
+numpy==2.0.2
+pandas==2.2.2
+scikit-learn==1.5.1
+matplotlib==3.9.2
+seaborn==0.13.2
+tweepy==4.14.0
+praw==7.7.1
+ccxt==4.3.89
+pyyaml==6.0.2
+transformers==4.44.2
+torch==2.4.0
+tqdm==4.66.5
+requests==2.31.0
+streamlit==1.28.0
